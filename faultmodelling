@@ -1,0 +1,279 @@
+    #include <stdio.h>
+    #include <math.h>
+    #include <stdint.h>
+
+    #ifndef M_PI
+    #define M_PI 3.14159265358979323846
+    #endif
+
+    // ---------------- Fault modes ----------------
+    typedef enum {
+        FAULT_HEALTHY = 0,
+        FAULT_STATOR_SHORT,     // Rs increase
+        FAULT_ROTOR_BROKEN_BAR, // Rr increase (+ torque ripple via TL disturbance)
+        FAULT_VOLTAGE_SAG,      // V_ll_rms scale down
+        FAULT_BEARING_FAULT,    // TL ripple (high-frequency)
+        FAULT_OVERLOAD          // TL scale up
+    } FaultMode;
+
+    typedef struct {
+        double t_start;     // seconds (inclusive)
+        double t_end;       // seconds (exclusive); use huge value for "until end"
+        FaultMode mode;
+        double severity;    // 0.0 .. 1.0 (interpreted per fault type)
+    } FaultEvent;
+    // ------------------------------------------------
+
+    typedef struct {
+        // Electrical
+        double Rs, Rr, Lls, Llr, Lm, Ls, Lr;
+        // Mechanical
+        int    P;
+        double J, B;
+        // Thermal
+        double Cth_s, Cth_r, R_sa, R_ra, R_sr, k_core;
+        // Supply
+        double V_ll_rms, f_e;
+        // Load
+        double T_load0, T_load_final, t_load_ramp;
+        // Ambient
+        double T_amb;
+    } Params;
+
+    typedef struct {
+        // States
+        double lds, lqs, ldr, lqr;  // flux linkages
+        double wr;                  // rotor speed (rad/s)
+        double Ts, Tr;              // stator & rotor temps (°C)
+        double t;                   // time (s)
+    } State;
+
+    // ---------------- helpers: active fault at time t ----------------
+    static int get_active_fault(const FaultEvent *ev, int N, double t,
+                                FaultMode *mode, double *severity)
+    {
+        for (int i = 0; i < N; ++i) {
+            if (t >= ev[i].t_start && t < ev[i].t_end) {
+                if (mode) *mode = ev[i].mode;
+                if (severity) *severity = ev[i].severity;
+                return 1;
+            }
+        }
+        if (mode) *mode = FAULT_HEALTHY;
+        if (severity) *severity = 0.0;
+        return 0;
+    }
+
+    // ---------------- motor derivatives (uses *effective* params) ----------------
+    static void im_derivs(const Params* p, const State* x,
+                        // outputs: derivatives
+                        double* dlds, double* dlqs, double* dldr, double* dlqr,
+                        double* dwr,  double* dTs,  double* dTr,
+                        // also compute these for logging
+                        double* ids,  double* iqs,  double* idr, double* iqr,
+                        double* Te,   double* Tload)
+    {
+        const double ws = 2.0 * M_PI * p->f_e;
+        const double slip_speed = ws - x->wr;
+
+        // Currents from flux linkages
+        const double det = p->Ls * p->Lr - p->Lm * p->Lm;
+        const double ids_ = (p->Lr * x->lds - p->Lm * x->ldr) / det;
+        const double iqs_ = (p->Lr * x->lqs - p->Lm * x->lqr) / det;
+        const double idr_ = (-p->Lm * x->lds + p->Ls * x->ldr) / det;
+        const double iqr_ = (-p->Lm * x->lqs + p->Ls * x->lqr) / det;
+
+        // Supply voltages (dq, synchronous frame) — effective Vd (Vq=0)
+        const double V_ph_rms  = p->V_ll_rms / sqrt(3.0);
+        const double V_ph_peak = sqrt(2.0) * V_ph_rms;
+        const double vds = V_ph_peak;
+        const double vqs = 0.0;
+
+        // Flux derivatives
+        *dlds = vds - p->Rs * ids_ + ws * x->lqs;
+        *dlqs = vqs - p->Rs * iqs_ - ws * x->lds;
+        *dldr = -p->Rr * idr_ + slip_speed * x->lqr;
+        *dlqr = -p->Rr * iqr_ - slip_speed * x->ldr;
+
+        // Electromagnetic torque
+        const double Te_ = 1.5 * (p->P / 2.0) * (x->lds * iqs_ - x->lqs * ids_);
+
+        // Load torque profile (ramp)
+        double Tload_;
+        if (x->t < p->t_load_ramp) {
+            Tload_ = p->T_load0 + (p->T_load_final - p->T_load0) * (x->t / p->t_load_ramp);
+        } else {
+            Tload_ = p->T_load_final;
+        }
+
+        // Mechanical dynamics
+        *dwr = (Te_ - Tload_ - p->B * x->wr) / p->J;
+
+        // Losses (for thermal)
+        const double Psc  = 3.0 * p->Rs * (ids_*ids_ + iqs_*iqs_);
+        const double Prc  = 3.0 * p->Rr * (idr_*idr_ + iqr_*iqr_);
+        const double Pcore = p->k_core * (V_ph_rms*V_ph_rms) * (p->f_e/50.0)
+                        * (1.0 + 0.1*sqrt(x->lds*x->lds + x->lqs*x->lqs));
+        const double Pfw   = p->B * x->wr * x->wr;
+
+        // Thermal dynamics
+        *dTs = (Psc + Pcore - (x->Ts - p->T_amb) / p->R_sa - (x->Ts - x->Tr) / p->R_sr) / p->Cth_s;
+        *dTr = (Prc + Pfw   - (x->Tr - x->Ts) / p->R_sr - (x->Tr - p->T_amb) / p->R_ra) / p->Cth_r;
+
+        // Copies for logging
+        if (ids)  *ids  = ids_;
+        if (iqs)  *iqs  = iqs_;
+        if (idr)  *idr  = idr_;
+        if (iqr)  *iqr  = iqr_;
+        if (Te)   *Te   = Te_;
+        if (Tload)*Tload= Tload_;
+    }
+
+    int main(void)
+    {
+        // ---- Base parameters (healthy) ----
+        Params p = {
+            // Electrical
+            .Rs=0.435, .Rr=0.816, .Lls=0.002, .Llr=0.002, .Lm=0.0693,
+            // Mechanical
+            .P=4, .J=0.089, .B=0.0005,
+            // Thermal
+            .Cth_s=4000.0, .Cth_r=3000.0, .R_sa=0.5, .R_ra=0.7, .R_sr=0.2, .k_core=5.0,
+            // Supply
+            .V_ll_rms=400.0, .f_e=50.0,
+            // Load profile
+            .T_load0=0.0, .T_load_final=50.0, .t_load_ramp=0.5,
+            // Ambient
+            .T_amb=25.0
+        };
+        p.Ls = p.Lls + p.Lm;
+        p.Lr = p.Llr + p.Lm;
+
+        // ---- Initial state ----
+        State x = {0};
+        x.lds = 0.0; x.lqs = 0.0; x.ldr = 0.0; x.lqr = 0.0;
+        x.wr  = 0.0; x.Ts  = p.T_amb; x.Tr  = p.T_amb; x.t = 0.0;
+
+        // ---- Fault schedule (edit to create datasets) ----
+        // Example: healthy until 0.30 s → stator short 30% until 0.55 s → voltage sag 20% until 0.75 s → overload 40% to end
+        FaultEvent schedule[] = {
+            {0.30, 0.55, FAULT_STATOR_SHORT,     0.30},
+            {0.55, 0.75, FAULT_VOLTAGE_SAG,      0.20},
+            {0.75, 1e9,  FAULT_OVERLOAD,         0.40},
+            // uncomment for rotor/bearing examples:
+            {0.40, 0.70, FAULT_ROTOR_BROKEN_BAR, 0.35},
+            {0.70, 1e9,  FAULT_BEARING_FAULT,    0.50}
+        };
+
+        const int Nschedule = (int)(sizeof(schedule)/sizeof(schedule[0]));
+
+        // ---- Integration settings ----
+        const double t_end = 1.0;       // seconds
+        const double dt    = 1e-4;      // 100 µs
+        const int    print_every = (int)lrint(1e-3 / dt); // print every 1 ms
+        int          k = 0;
+
+        // ---- CSV header ----
+        printf("t,i_ds,i_qs,i_dr,i_qr,Te,T_load,w_r,T_s,T_r,fault_mode,severity\n");
+
+        // ---- Time loop ----
+        while (x.t <= t_end + 1e-12) {
+            // Determine active fault for this instant
+            FaultMode fm; double sev;
+            get_active_fault(schedule, Nschedule, x.t, &fm, &sev);
+
+            // Make a per-step effective parameter copy
+            Params p_step = p;
+
+            // ----- Apply faults by modifying effective parameters/inputs -----
+            // NOTE: these are simple but realistic mappings
+            switch (fm) {
+                case FAULT_STATOR_SHORT:
+                    // Increase Rs by (1 + 0.3 .. 1.0)
+                    p_step.Rs *= (1.0 + sev);
+                    break;
+
+                case FAULT_ROTOR_BROKEN_BAR:
+                    // Increase Rr by (1 + 0.2 .. 0.6)
+                    p_step.Rr *= (1.0 + 1.2*sev);
+                    // We'll add torque ripple via load later (see below)
+                    break;
+
+                case FAULT_VOLTAGE_SAG:
+                    // Reduce supply by (1 - 0.1 .. 0.5)
+                    p_step.V_ll_rms *= (1.0 - 0.5*sev);
+                    if (p_step.V_ll_rms < 1.0) p_step.V_ll_rms = 1.0; // floor
+                    break;
+
+                case FAULT_BEARING_FAULT:
+                    // No param change; we’ll disturb load torque below
+                    break;
+
+                case FAULT_OVERLOAD:
+                    // No param change; we’ll scale load torque below
+                    break;
+
+                case FAULT_HEALTHY:
+                default:
+                    break;
+            }
+
+            // Derivatives + log vars at current state (using effective params)
+            double dlds, dlqs, dldr, dlqr, dwr, dTs, dTr;
+            double ids, iqs, idr, iqr, Te, Tload;
+            im_derivs(&p_step, &x, &dlds, &dlqs, &dldr, &dlqr, &dwr, &dTs, &dTr,
+                    &ids, &iqs, &idr, &iqr, &Te, &Tload);
+
+            // Post-derivative fault effects that act like *load* disturbances:
+            // (We modify the mechanical derivative dwr by re-computing the net torque)
+            double TL_eff = Tload;
+
+            if (fm == FAULT_OVERLOAD) {
+                TL_eff *= (1.0 + sev); // more load torque
+            }
+
+            if (fm == FAULT_BEARING_FAULT) {
+                // Add high-frequency ripple to effective load (vibration signature)
+                // freq: 50× electrical frequency is a common ballpark vibration harmonic
+                //double wf = 1.0 * M_PI * (p.f_e * 10.0);
+                //TL_eff += 0.15 * fabs(Te) * sin(wf * x.t) * (0.5 + sev); // scale with severity
+
+                double fault_freq_hz = p.f_e * 10.0; // 50 * 50Hz = 2500 Hz
+                double wf = 2.0 * M_PI * fault_freq_hz; // Convert Hz to rad/s
+                TL_eff += 0.20 * fabs(Te) * sin(wf * x.t) * (0.5 + sev);
+            }
+
+            if (fm == FAULT_ROTOR_BROKEN_BAR) {
+                // Low-frequency torque pulsation ~2× slip freq (approx via mechanical speed here)
+                double wf = 2.0 * fabs(x.wr); // crude proxy; OK for dataset synthesis
+                TL_eff += 0.10 * fabs(Te) * sin(wf * x.t) * (0.5 + 0.5*sev);
+                //p_step.Rr *= (1.0 +1.2*sev);
+            }
+
+            // Recompute mechanical derivative with TL_eff (keep electrical/thermal as computed)
+            double dwr_eff = (Te - TL_eff - p_step.B * x.wr) / p_step.J;
+
+            // Euler step
+            x.lds += dlds * dt;
+            x.lqs += dlqs * dt;
+            x.ldr += dldr * dt;
+            x.lqr += dlqr * dt;
+            x.wr  += dwr_eff * dt;  // use modified mech derivative
+            x.Ts  += dTs  * dt;
+            x.Tr  += dTr  * dt;
+            x.t   += dt;
+
+            // (Optional) clamp to physical ranges
+            if (x.Ts < -50) x.Ts = -50; if (x.Ts > 300) x.Ts = 300;
+            if (x.Tr < -50) x.Tr = -50; if (x.Tr > 300) x.Tr = 300;
+
+            // Print every 1 ms
+            if ((k % print_every) == 0) {
+                printf("%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.3f\n",
+                    x.t, ids, iqs, idr, iqr, Te, TL_eff, x.wr, x.Ts, x.Tr, (int)fm, sev);
+            }
+            ++k;
+        }
+
+        return 0;
+    }
